@@ -1,0 +1,283 @@
+openapi: 3.0.0
+servers:
+  # Added by API Auto Mocking Plugin
+  - description: SwaggerHub API Auto Mocking
+    url: https://virtserver.swaggerhub.com/columbia-bf9/orderAndRentalService/1.0.0
+info:
+  description: This is the Order & Rental Service API for the Luxury Fashion Rental Platform.
+  version: "1.0.0"
+  title: Order & Rental Service API
+  contact:
+    email: you@your-company.com
+  license:
+    name: Apache 2.0
+    url: 'http://www.apache.org/licenses/LICENSE-2.0.html'
+tags:
+  - name: users
+    description: Operations available to regular users (placing and viewing orders)
+  - name: admins
+    description: Admin-only operations (status updates, viewing all orders)
+
+paths:
+  /orders:
+    get:
+      tags:
+        - users
+      summary: Get all rental orders
+      operationId: listOrders
+      description: |
+        Retrieves all rental orders. Users can view their own orders.
+        Admins can view all orders.
+      parameters:
+        - in: query
+          name: status
+          description: Filter orders by status
+          required: false
+          schema:
+            type: string
+            enum: [pending, active, returned, cancelled]
+        - in: query
+          name: user_id
+          description: (Admin only) Filter orders by user ID
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of orders matching criteria
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid query parameter
+    post:
+      tags:
+        - users
+      summary: Create a new rental order
+      operationId: createOrder
+      description: Creates a new rental order for a selected catalog item.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderRequest'
+        description: Rental order creation request
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid input data
+        '409':
+          description: Conflicting order or unavailable item
+
+  /orders/{orderId}:
+    get:
+      tags:
+        - users
+      summary: Get order details
+      operationId: getOrderById
+      description: Retrieves detailed information of a specific order by ID.
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          description: ID of the order to fetch
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Order detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: Order not found
+    delete:
+      tags:
+        - users
+      summary: Cancel an existing order
+      operationId: cancelOrder
+      description: Cancels an order if its status is still pending.
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          description: ID of the order to cancel
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Order cancelled successfully
+        '400':
+          description: Cannot cancel non-pending order
+        '404':
+          description: Order not found
+
+  /orders/{orderId}/status:
+    patch:
+      tags:
+        - admins
+      summary: Update order status
+      operationId: updateOrderStatus
+      description: Allows admin to update the status of an order.
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          description: ID of the order to update
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                new_status:
+                  type: string
+                  enum: [pending, active, returned, cancelled]
+              required:
+                - new_status
+        description: The new status of the order
+      responses:
+        '200':
+          description: Order status updated successfully
+        '400':
+          description: Invalid status transition
+        '404':
+          description: Order not found
+
+  /orders/{orderId}/logs:
+    get:
+      tags:
+        - admins
+      summary: Retrieve order status change logs
+      operationId: getOrderLogs
+      description: Fetches the audit log for status transitions of a specific order.
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          description: ID of the order
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of order logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrderLog'
+        '404':
+          description: Order not found
+
+components:
+  schemas:
+    Order:
+      type: object
+      required:
+        - id
+        - user_id
+        - item_id
+        - start_date
+        - end_date
+        - status
+      properties:
+        id:
+          type: integer
+          example: 101
+        user_id:
+          type: integer
+          example: 12
+        item_id:
+          type: integer
+          example: 505
+        start_date:
+          type: string
+          format: date
+          example: '2025-05-01'
+        end_date:
+          type: string
+          format: date
+          example: '2025-05-07'
+        total_rent:
+          type: number
+          format: float
+          example: 499.99
+        deposit:
+          type: number
+          format: float
+          example: 1000.00
+        status:
+          type: string
+          enum: [pending, active, returned, cancelled]
+          example: pending
+        created_at:
+          type: string
+          format: date-time
+          example: '2025-04-28T10:30:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2025-04-29T14:00:00Z'
+
+    OrderRequest:
+      type: object
+      required:
+        - user_id
+        - item_id
+        - start_date
+        - end_date
+      properties:
+        user_id:
+          type: integer
+          example: 12
+        item_id:
+          type: integer
+          example: 505
+        start_date:
+          type: string
+          format: date
+          example: '2025-05-01'
+        end_date:
+          type: string
+          format: date
+          example: '2025-05-07'
+
+    OrderLog:
+      type: object
+      required:
+        - log_id
+        - order_id
+        - from_status
+        - to_status
+        - timestamp
+      properties:
+        log_id:
+          type: integer
+          example: 2001
+        order_id:
+          type: integer
+          example: 101
+        from_status:
+          type: string
+          example: pending
+        to_status:
+          type: string
+          example: active
+        timestamp:
+          type: string
+          format: date-time
+          example: '2025-05-02T09:00:00Z'
