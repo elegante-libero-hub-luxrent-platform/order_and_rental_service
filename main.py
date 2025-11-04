@@ -1,170 +1,202 @@
 from __future__ import annotations
-
 import os
-import socket
 from datetime import datetime
-
-from typing import Dict, List
-from uuid import UUID
-
 from fastapi import FastAPI, HTTPException
 from fastapi import Query, Path
-from typing import Optional
+from typing import Dict, List, Optional
 
-from models.person import PersonCreate, PersonRead, PersonUpdate
-from models.address import AddressCreate, AddressRead, AddressUpdate
-from models.health import Health
+from models.order import (
+    OrderCreate,
+    OrderRead,
+    OrderStatus,
+    OrderStatusUpdate
+)
+from models.log import (
+    OrderLogRead
+)
 
 port = int(os.environ.get("FASTAPIPORT", 8000))
 
 # -----------------------------------------------------------------------------
 # Fake in-memory "databases"
 # -----------------------------------------------------------------------------
-persons: Dict[UUID, PersonRead] = {}
-addresses: Dict[UUID, AddressRead] = {}
+# Stores OrderRead objects, keyed by order ID (int)
+orders: Dict[int, OrderRead] = {}
+# Stores a list of OrderLogRead objects for each order ID (int)
+order_logs: Dict[int, List[OrderLogRead]] = {}
+
+# Simple auto-incrementing counters for IDs
+_order_id_counter = 100
+_log_id_counter = 2000
 
 app = FastAPI(
-    title="Person/Address API",
-    description="Demo FastAPI app using Pydantic v2 models for Person and Address",
-    version="0.1.0",
+    title="Order & Rental Service API",
+    description="This is the Order & Rental Service API for the Luxury Fashion Rental Platform.",
+    version="1.0.0",
 )
 
+
 # -----------------------------------------------------------------------------
-# Address endpoints
+# Helper Function
 # -----------------------------------------------------------------------------
 
-def make_health(echo: Optional[str], path_echo: Optional[str]=None) -> Health:
-    return Health(
-        status=200,
-        status_message="OK",
-        timestamp=datetime.utcnow().isoformat() + "Z",
-        ip_address=socket.gethostbyname(socket.gethostname()),
-        echo=echo,
-        path_echo=path_echo
+def _create_log(
+        order_id: int,
+        from_status: OrderStatus,
+        to_status: OrderStatus
+) -> OrderLogRead:
+    """Internal helper to create and store an order log."""
+    global _log_id_counter
+    _log_id_counter += 1
+    new_log_id = _log_id_counter
+
+    log_entry = OrderLogRead(
+        log_id=new_log_id,
+        order_id=order_id,
+        from_status=from_status,
+        to_status=to_status,
+        timestamp=datetime.utcnow()
     )
 
-@app.get("/health", response_model=Health)
-def get_health_no_path(echo: str | None = Query(None, description="Optional echo string")):
-    # Works because path_echo is optional in the model
-    return make_health(echo=echo, path_echo=None)
+    if order_id not in order_logs:
+        order_logs[order_id] = []
+    order_logs[order_id].append(log_entry)
+    return log_entry
 
-@app.get("/health/{path_echo}", response_model=Health)
-def get_health_with_path(
-    path_echo: str = Path(..., description="Required echo in the URL path"),
-    echo: str | None = Query(None, description="Optional echo string"),
+
+# -----------------------------------------------------------------------------
+# Order Endpoints
+# -----------------------------------------------------------------------------
+
+@app.post("/orders", response_model=OrderRead, status_code=201, tags=["users"])
+def create_order(order: OrderCreate):
+    """Creates a new rental order for a selected catalog item."""
+    global _order_id_counter
+    _order_id_counter += 1
+    new_id = _order_id_counter
+
+    now = datetime.utcnow()
+
+    # In a real app, total_rent and deposit would be calculated here
+    new_order = OrderRead(
+        **order.model_dump(),
+        id=new_id,
+        status=OrderStatus.PENDING,  # New orders default to pending
+        created_at=now,
+        updated_at=now,
+        total_rent=499.99,  # Example fixed value
+        deposit=1000.00  # Example fixed value
+    )
+
+    orders[new_id] = new_order
+
+    # Log the creation event
+    _create_log(new_id, from_status=OrderStatus.PENDING, to_status=OrderStatus.PENDING)
+
+    return new_order
+
+
+@app.get("/orders", response_model=List[OrderRead], tags=["users"])
+def list_orders(
+        status: Optional[OrderStatus] = Query(None, description="Filter orders by status"),
+        user_id: Optional[int] = Query(None, description="(Admin only) Filter orders by user ID")
 ):
-    return make_health(echo=echo, path_echo=path_echo)
+    """Retrieves all rental orders, with optional filtering."""
+    results = list(orders.values())
 
-@app.post("/addresses", response_model=AddressRead, status_code=201)
-def create_address(address: AddressCreate):
-    if address.id in addresses:
-        raise HTTPException(status_code=400, detail="Address with this ID already exists")
-    addresses[address.id] = AddressRead(**address.model_dump())
-    return addresses[address.id]
-
-@app.get("/addresses", response_model=List[AddressRead])
-def list_addresses(
-    street: Optional[str] = Query(None, description="Filter by street"),
-    city: Optional[str] = Query(None, description="Filter by city"),
-    state: Optional[str] = Query(None, description="Filter by state/region"),
-    postal_code: Optional[str] = Query(None, description="Filter by postal code"),
-    country: Optional[str] = Query(None, description="Filter by country"),
-):
-    results = list(addresses.values())
-
-    if street is not None:
-        results = [a for a in results if a.street == street]
-    if city is not None:
-        results = [a for a in results if a.city == city]
-    if state is not None:
-        results = [a for a in results if a.state == state]
-    if postal_code is not None:
-        results = [a for a in results if a.postal_code == postal_code]
-    if country is not None:
-        results = [a for a in results if a.country == country]
+    if status:
+        results = [o for o in results if o.status == status]
+    if user_id:
+        # In a real app, you'd check user auth here to see if they are an admin
+        results = [o for o in results if o.user_id == user_id]
 
     return results
 
-@app.get("/addresses/{address_id}", response_model=AddressRead)
-def get_address(address_id: UUID):
-    if address_id not in addresses:
-        raise HTTPException(status_code=404, detail="Address not found")
-    return addresses[address_id]
 
-@app.patch("/addresses/{address_id}", response_model=AddressRead)
-def update_address(address_id: UUID, update: AddressUpdate):
-    if address_id not in addresses:
-        raise HTTPException(status_code=404, detail="Address not found")
-    stored = addresses[address_id].model_dump()
-    stored.update(update.model_dump(exclude_unset=True))
-    addresses[address_id] = AddressRead(**stored)
-    return addresses[address_id]
-
-# -----------------------------------------------------------------------------
-# Person endpoints
-# -----------------------------------------------------------------------------
-@app.post("/persons", response_model=PersonRead, status_code=201)
-def create_person(person: PersonCreate):
-    # Each person gets its own UUID; stored as PersonRead
-    person_read = PersonRead(**person.model_dump())
-    persons[person_read.id] = person_read
-    return person_read
-
-@app.get("/persons", response_model=List[PersonRead])
-def list_persons(
-    uni: Optional[str] = Query(None, description="Filter by Columbia UNI"),
-    first_name: Optional[str] = Query(None, description="Filter by first name"),
-    last_name: Optional[str] = Query(None, description="Filter by last name"),
-    email: Optional[str] = Query(None, description="Filter by email"),
-    phone: Optional[str] = Query(None, description="Filter by phone number"),
-    birth_date: Optional[str] = Query(None, description="Filter by date of birth (YYYY-MM-DD)"),
-    city: Optional[str] = Query(None, description="Filter by city of at least one address"),
-    country: Optional[str] = Query(None, description="Filter by country of at least one address"),
+@app.get("/orders/{orderId}", response_model=OrderRead, tags=["users"])
+def get_order_by_id(
+        orderId: int = Path(..., description="ID of the order to fetch")
 ):
-    results = list(persons.values())
+    """Retrieves detailed information of a specific order by ID."""
+    if orderId not in orders:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return orders[orderId]
 
-    if uni is not None:
-        results = [p for p in results if p.uni == uni]
-    if first_name is not None:
-        results = [p for p in results if p.first_name == first_name]
-    if last_name is not None:
-        results = [p for p in results if p.last_name == last_name]
-    if email is not None:
-        results = [p for p in results if p.email == email]
-    if phone is not None:
-        results = [p for p in results if p.phone == phone]
-    if birth_date is not None:
-        results = [p for p in results if str(p.birth_date) == birth_date]
 
-    # nested address filtering
-    if city is not None:
-        results = [p for p in results if any(addr.city == city for addr in p.addresses)]
-    if country is not None:
-        results = [p for p in results if any(addr.country == country for addr in p.addresses)]
+@app.delete("/orders/{orderId}", status_code=200, tags=["users"])
+def cancel_order(
+        orderId: int = Path(..., description="ID of the order to cancel")
+):
+    """Cancels an order if its status is still pending."""
+    if orderId not in orders:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    return results
+    order = orders[orderId]
 
-@app.get("/persons/{person_id}", response_model=PersonRead)
-def get_person(person_id: UUID):
-    if person_id not in persons:
-        raise HTTPException(status_code=404, detail="Person not found")
-    return persons[person_id]
+    if order.status != OrderStatus.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel non-pending order"
+        )
 
-@app.patch("/persons/{person_id}", response_model=PersonRead)
-def update_person(person_id: UUID, update: PersonUpdate):
-    if person_id not in persons:
-        raise HTTPException(status_code=404, detail="Person not found")
-    stored = persons[person_id].model_dump()
-    stored.update(update.model_dump(exclude_unset=True))
-    persons[person_id] = PersonRead(**stored)
-    return persons[person_id]
+    old_status = order.status
+    order.status = OrderStatus.CANCELLED
+    order.updated_at = datetime.utcnow()
+
+    # Log the cancellation
+    _create_log(order.id, from_status=old_status, to_status=order.status)
+
+    return {"message": "Order cancelled successfully"}
+
+
+@app.patch("/orders/{orderId}/status", response_model=OrderRead, tags=["admins"])
+def update_order_status(
+        status_update: OrderStatusUpdate,
+        orderId: int = Path(..., description="ID of the order to update")
+):
+    """Allows admin to update the status of an order."""
+    if orderId not in orders:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order = orders[orderId]
+    old_status = order.status
+    new_status = status_update.new_status
+
+    # Basic state transition validation
+    if old_status in [OrderStatus.CANCELLED, OrderStatus.RETURNED]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status transition: cannot update order from terminal state '{old_status.value}'"
+        )
+
+    if old_status != new_status:
+        order.status = new_status
+        order.updated_at = datetime.utcnow()
+        # Log the change
+        _create_log(order.id, from_status=old_status, to_status=new_status)
+
+    return order
+
+
+@app.get("/orders/{orderId}/logs", response_model=List[OrderLogRead], tags=["admins"])
+def get_order_logs(
+        orderId: int = Path(..., description="ID of the order")
+):
+    """Fetches the audit log for status transitions of a specific order."""
+    if orderId not in orders:
+        # Check if the order itself exists
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return order_logs.get(orderId, [])
+
 
 # -----------------------------------------------------------------------------
 # Root
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Welcome to the Person/Address API. See /docs for OpenAPI UI."}
+    return {"message": "Welcome to the Order & Rental Service API. See /docs for OpenAPI UI."}
+
 
 # -----------------------------------------------------------------------------
 # Entrypoint for `python main.py`
