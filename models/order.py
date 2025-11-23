@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, UTC
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from pydantic import BaseModel, Field
 
@@ -82,6 +82,16 @@ class OrderRead(OrderBase):
         example="2025-04-29T14:00:00Z"
     )
 
+    links: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Related resource links for this order, including self, user, and item.",
+        example={
+            "self": "/orders/101",
+            "user": "/users/12",
+            "item": "/items/505",
+        },
+    )
+
     model_config = {
         "json_schema_extra": {
             "examples": [
@@ -95,7 +105,12 @@ class OrderRead(OrderBase):
                     "deposit": 1000.00,
                     "status": "pending",
                     "created_at": "2025-04-28T10:30:00Z",
-                    "updated_at": "2025-04-29T14:00:00Z"
+                    "updated_at": "2025-04-29T14:00:00Z",
+                    "links": {
+                        "self": "/orders/101",
+                        "user": "/users/12",
+                        "item": "/items/505",
+                    }
                 }
             ]
         }

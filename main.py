@@ -1,206 +1,641 @@
 from __future__ import annotations
+
 import os
-from datetime import datetime
-from fastapi import FastAPI, HTTPException
-from fastapi import Query, Path
+import uuid
+from datetime import datetime, UTC
 from typing import Dict, List, Optional
+
+import mysql.connector
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Path, Query, Response
+from google.cloud import secretmanager
 
 from models.order import (
     OrderCreate,
     OrderRead,
     OrderStatus,
-    OrderStatusUpdate
+    OrderStatusUpdate,
 )
-from models.log import (
-    OrderLogRead
-)
+from models.log import OrderLogRead
+from models.job import JobRead, JobStatus
 
+# ---------------------------------------------------------------------
+# Server Port Configuration (Cloud Run / local development)
+# ---------------------------------------------------------------------
 port = int(os.environ.get("FASTAPIPORT", 8000))
 
-# -----------------------------------------------------------------------------
-# Fake in-memory "databases"
-# -----------------------------------------------------------------------------
-# Stores OrderRead objects, keyed by order ID (int)
-orders: Dict[int, OrderRead] = {}
-# Stores a list of OrderLogRead objects for each order ID (int)
-order_logs: Dict[int, List[OrderLogRead]] = {}
+# ---------------------------------------------------------------------
+# Secret Manager helper for retrieving MySQL password
+# ---------------------------------------------------------------------
+def get_secret(secret_name: str) -> str:
+    """
+    Fetch secrets (e.g., DB password) from Google Secret Manager.
+    """
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{os.environ['GCP_PROJECT_ID']}/secrets/{secret_name}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("utf-8")
 
-# Simple auto-incrementing counters for IDs
-_order_id_counter = 100
-_log_id_counter = 2000
 
+# ---------------------------------------------------------------------
+# Database Configuration (Cloud SQL)
+# ---------------------------------------------------------------------
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_USER = os.environ["DB_USER"]
+DB_NAME = os.environ["DB_NAME"]
+DB_PASSWORD = get_secret("orders-db-password")
+
+# In-memory cache only for tracking real-time job status during background execution.
+# The true persistent job state is stored in Cloud SQL.
+jobs_memory: Dict[str, Dict] = {}
+
+
+def get_connection():
+    """
+    Create a new MySQL connection.
+    """
+    return mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        port=DB_PORT,
+    )
+
+
+# ---------------------------------------------------------------------
+# FastAPI Application
+# ---------------------------------------------------------------------
 app = FastAPI(
     title="Order & Rental Service API",
-    description="This is the Order & Rental Service API for the Luxury Fashion Rental Platform.",
+    description="Handles order lifecycle, state transitions, async jobs, and logging.",
     version="1.0.0",
 )
 
+# ---------------------------------------------------------------------
+# Helper Functions for HATEOAS + Mapping DB Rows to Pydantic Models
+# ---------------------------------------------------------------------
+def _build_order_links(order: OrderRead) -> Dict[str, str]:
+    """
+    Construct HATEOAS links for an order resource.
+    """
+    return {
+        "self": f"/orders/{order.id}",
+        "user": f"/users/{order.user_id}",
+        "item": f"/items/{order.item_id}",
+    }
 
-# -----------------------------------------------------------------------------
-# Helper Function
-# -----------------------------------------------------------------------------
 
-def _create_log(
-        order_id: int,
-        from_status: OrderStatus,
-        to_status: OrderStatus
-) -> OrderLogRead:
-    """Internal helper to create and store an order log."""
-    global _log_id_counter
-    _log_id_counter += 1
-    new_log_id = _log_id_counter
+def _ensure_order_links(order: OrderRead) -> OrderRead:
+    """
+    Attach HATEOAS links to the OrderRead object if missing.
+    """
+    if getattr(order, "links", None) is None:
+        order.links = _build_order_links(order)
+    return order
 
-    log_entry = OrderLogRead(
-        log_id=new_log_id,
-        order_id=order_id,
+
+def _row_to_order(row) -> OrderRead:
+    """
+    Convert a database row into an OrderRead model.
+    Expected row layout follows schema.sql:
+    (id, user_id, item_id, status, total_rent, deposit,
+     created_at, updated_at, start_date, end_date)
+    """
+    return _ensure_order_links(
+        OrderRead(
+            id=row[0],
+            user_id=row[1],
+            item_id=row[2],
+            status=OrderStatus(row[3]),
+            total_rent=row[4],
+            deposit=row[5],
+            created_at=row[6],
+            updated_at=row[7],
+            start_date=row[8],
+            end_date=row[9],
+        )
+    )
+
+
+def _row_to_log(row) -> OrderLogRead:
+    """
+    Convert a DB row into an OrderLogRead object.
+    """
+    from_status = OrderStatus(row[2]) if row[2] is not None else None
+    to_status = OrderStatus(row[3]) if row[3] is not None else None
+    return OrderLogRead(
+        log_id=row[0],
+        order_id=row[1],
         from_status=from_status,
         to_status=to_status,
-        timestamp=datetime.utcnow()
+        timestamp=row[4],
     )
 
-    if order_id not in order_logs:
-        order_logs[order_id] = []
-    order_logs[order_id].append(log_entry)
-    return log_entry
+
+def _create_log_db(conn, order_id: int, from_status: OrderStatus, to_status: OrderStatus, ts: Optional[datetime] = None):
+    """
+    Insert a new order status transition log into the database.
+    """
+    if ts is None:
+        ts = datetime.now(UTC)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO order_logs (order_id, from_status, to_status, timestamp)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (order_id, from_status.value, to_status.value, ts),
+    )
+    conn.commit()
+    cursor.close()
 
 
-# -----------------------------------------------------------------------------
-# Order Endpoints
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Background Task: Asynchronous Order Confirmation
+# ---------------------------------------------------------------------
+def _process_confirm_order(order_id: int, job_id: str) -> None:
+    """
+    Background task simulating async confirmation workflow.
+    Updates both:
+    - jobs_memory: real-time tracking for the background process
+    - jobs table: persistent status for API querying
+    """
+    jobs_memory[job_id]["status"] = JobStatus.RUNNING.value
 
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, item_id, status, total_rent, deposit,
+                   created_at, updated_at, start_date, end_date
+            FROM orders
+            WHERE id = %s
+            """,
+            (order_id,),
+        )
+        row = cursor.fetchone()
+
+        if row is None:
+            # Order not found → mark job as failed
+            cursor.execute(
+                "UPDATE jobs SET status=%s, result=%s WHERE job_id=%s",
+                (JobStatus.FAILED.value, "order_not_found", job_id),
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            jobs_memory[job_id]["status"] = JobStatus.FAILED.value
+            jobs_memory[job_id]["result"] = "order_not_found"
+            return
+
+        current_status = OrderStatus(row[3])
+        if current_status != OrderStatus.PENDING:
+            # Invalid state transition
+            cursor.execute(
+                "UPDATE jobs SET status=%s, result=%s WHERE job_id=%s",
+                (JobStatus.FAILED.value, "invalid_state", job_id),
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            jobs_memory[job_id]["status"] = JobStatus.FAILED.value
+            jobs_memory[job_id]["result"] = "invalid_state"
+            return
+
+        # Apply confirmation → update status to ACTIVE
+        now = datetime.now(UTC)
+        cursor.execute(
+            """
+            UPDATE orders
+            SET status=%s, updated_at=%s
+            WHERE id=%s
+            """,
+            (OrderStatus.ACTIVE.value, now, order_id),
+        )
+        _create_log_db(conn, order_id, current_status, OrderStatus.ACTIVE, now)
+
+        # Mark job as succeeded
+        cursor.execute(
+            "UPDATE jobs SET status=%s, result=%s WHERE job_id=%s",
+            (JobStatus.SUCCEEDED.value, f"/orders/{order_id}", job_id),
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        jobs_memory[job_id]["status"] = JobStatus.SUCCEEDED.value
+        jobs_memory[job_id]["result"] = f"/orders/{order_id}"
+
+    except Exception:
+        # Catch-all fallback: record failure in DB and memory
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE jobs SET status=%s, result=%s WHERE job_id=%s",
+                (JobStatus.FAILED.value, "internal_error", job_id),
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception:
+            pass
+
+        jobs_memory[job_id]["status"] = JobStatus.FAILED.value
+        jobs_memory[job_id]["result"] = "internal_error"
+
+
+# ---------------------------------------------------------------------
+# ORDERS API
+# ---------------------------------------------------------------------
 @app.post("/orders", response_model=OrderRead, status_code=201, tags=["users"])
-def create_order(order: OrderCreate):
-    """Creates a new rental order for a selected catalog item."""
-    global _order_id_counter
-    _order_id_counter += 1
-    new_id = _order_id_counter
-
-    now = datetime.utcnow()
-
-    # In a real app, total_rent and deposit would be calculated here
-    new_order = OrderRead(
-        **order.model_dump(),
-        id=new_id,
-        status=OrderStatus.PENDING,  # New orders default to pending
-        created_at=now,
-        updated_at=now,
-        total_rent=499.99,  # Example fixed value
-        deposit=1000.00  # Example fixed value
+def create_order(order: OrderCreate, response: Response):
+    """
+    Create a new order and persist it to Cloud SQL.
+    Automatically:
+    - sets initial status to PENDING
+    - generates a PENDING→PENDING log entry
+    - returns Location header for REST compliance
+    """
+    now = datetime.now(UTC)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO orders (
+            user_id, item_id, status, total_rent, deposit,
+            created_at, updated_at, start_date, end_date
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            order.user_id,
+            order.item_id,
+            OrderStatus.PENDING.value,
+            499.99,      # business logic placeholder
+            1000.00,     # business logic placeholder
+            now,
+            now,
+            order.start_date,
+            order.end_date,
+        ),
     )
+    order_id = cursor.lastrowid
 
-    orders[new_id] = new_order
+    # Initial log: PENDING -> PENDING
+    _create_log_db(conn, order_id, OrderStatus.PENDING, OrderStatus.PENDING, now)
 
-    # Log the creation event
-    _create_log(new_id, from_status=OrderStatus.PENDING, to_status=OrderStatus.PENDING)
+    cursor.execute(
+        """
+        SELECT id, user_id, item_id, status, total_rent, deposit,
+               created_at, updated_at, start_date, end_date
+        FROM orders
+        WHERE id = %s
+        """,
+        (order_id,),
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
 
-    return new_order
+    if row is None:
+        raise HTTPException(500, "Failed to create order")
+
+    order_obj = _row_to_order(row)
+    response.headers["Location"] = f"/orders/{order_id}"
+    return order_obj
 
 
 @app.get("/orders", response_model=List[OrderRead], tags=["users"])
 def list_orders(
-        status: Optional[OrderStatus] = Query(None, description="Filter orders by status"),
-        user_id: Optional[int] = Query(None, description="(Admin only) Filter orders by user ID")
+    status: Optional[OrderStatus] = Query(None, alias="state"),
+    user_id: Optional[int] = Query(None, alias="userId"),
+    item_id: Optional[int] = Query(None, alias="itemId"),
+    from_: Optional[datetime] = Query(None, alias="from"),
+    to_: Optional[datetime] = Query(None, alias="to"),
 ):
-    """Retrieves all rental orders, with optional filtering."""
-    results = list(orders.values())
+    """
+    List orders with optional filtering:
+    - state
+    - userId
+    - itemId
+    - created_at date range
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = """
+        SELECT id, user_id, item_id, status, total_rent, deposit,
+               created_at, updated_at, start_date, end_date
+        FROM orders
+        WHERE 1=1
+    """
+    params: List = []
 
-    if status:
-        results = [o for o in results if o.status == status]
-    if user_id:
-        # In a real app, you'd check user auth here to see if they are an admin
-        results = [o for o in results if o.user_id == user_id]
+    if status is not None:
+        query += " AND status = %s"
+        params.append(status.value)
+    if user_id is not None:
+        query += " AND user_id = %s"
+        params.append(user_id)
+    if item_id is not None:
+        query += " AND item_id = %s"
+        params.append(item_id)
+    if from_ is not None:
+        query += " AND created_at >= %s"
+        params.append(from_)
+    if to_ is not None:
+        query += " AND created_at <= %s"
+        params.append(to_)
 
-    return results
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return [_row_to_order(r) for r in rows]
 
 
 @app.get("/orders/{orderId}", response_model=OrderRead, tags=["users"])
-def get_order_by_id(
-        orderId: int = Path(..., description="ID of the order to fetch")
-):
-    """Retrieves detailed information of a specific order by ID."""
-    if orderId not in orders:
-        raise HTTPException(status_code=404, detail="Order not found")
-    return orders[orderId]
+def get_order_by_id(orderId: int = Path(...)):
+    """
+    Retrieve a single order by ID.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, item_id, status, total_rent, deposit,
+               created_at, updated_at, start_date, end_date
+        FROM orders
+        WHERE id = %s
+        """,
+        (orderId,),
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(404, "Order not found")
+
+    return _row_to_order(row)
 
 
-@app.delete("/orders/{orderId}", status_code=200, tags=["users"])
-def cancel_order(
-        orderId: int = Path(..., description="ID of the order to cancel")
-):
-    """Cancels an order if its status is still pending."""
-    if orderId not in orders:
-        raise HTTPException(status_code=404, detail="Order not found")
+@app.delete("/orders/{orderId}", tags=["users"])
+def cancel_order(orderId: int = Path(...)):
+    """
+    Cancel an order.
+    Only orders in PENDING state may be cancelled.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, item_id, status, total_rent, deposit,
+               created_at, updated_at, start_date, end_date
+        FROM orders
+        WHERE id = %s
+        """,
+        (orderId,),
+    )
+    row = cursor.fetchone()
 
-    order = orders[orderId]
+    if row is None:
+        cursor.close()
+        conn.close()
+        raise HTTPException(404, "Order not found")
 
-    if order.status != OrderStatus.PENDING:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot cancel non-pending order"
-        )
+    current_status = OrderStatus(row[3])
+    if current_status != OrderStatus.PENDING:
+        cursor.close()
+        conn.close()
+        raise HTTPException(400, "Cannot cancel non-pending order")
 
-    old_status = order.status
-    order.status = OrderStatus.CANCELLED
-    order.updated_at = datetime.utcnow()
-
-    # Log the cancellation
-    _create_log(order.id, from_status=old_status, to_status=order.status)
+    now = datetime.now(UTC)
+    cursor.execute(
+        """
+        UPDATE orders
+        SET status=%s, updated_at=%s
+        WHERE id=%s
+        """,
+        (OrderStatus.CANCELLED.value, now, orderId),
+    )
+    _create_log_db(conn, orderId, current_status, OrderStatus.CANCELLED, now)
+    conn.commit()
+    cursor.close()
+    conn.close()
 
     return {"message": "Order cancelled successfully"}
 
 
 @app.patch("/orders/{orderId}/status", response_model=OrderRead, tags=["admins"])
-def update_order_status(
-        status_update: OrderStatusUpdate,
-        orderId: int = Path(..., description="ID of the order to update")
-):
-    """Allows admin to update the status of an order."""
-    if orderId not in orders:
-        raise HTTPException(status_code=404, detail="Order not found")
+def update_order_status(status_update: OrderStatusUpdate, orderId: int = Path(...)):
+    """
+    Admin endpoint to change an order's status.
+    Restrictions:
+      - CANCELLED or RETURNED states are terminal.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, item_id, status, total_rent, deposit,
+               created_at, updated_at, start_date, end_date
+        FROM orders
+        WHERE id = %s
+        """,
+        (orderId,),
+    )
+    row = cursor.fetchone()
 
-    order = orders[orderId]
-    old_status = order.status
+    if row is None:
+        cursor.close()
+        conn.close()
+        raise HTTPException(404, "Order not found")
+
+    old_status = OrderStatus(row[3])
     new_status = status_update.new_status
 
-    # Basic state transition validation
     if old_status in [OrderStatus.CANCELLED, OrderStatus.RETURNED]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status transition: cannot update order from terminal state '{old_status.value}'"
-        )
+        cursor.close()
+        conn.close()
+        raise HTTPException(400, f"Cannot update terminal state '{old_status.value}'")
 
     if old_status != new_status:
-        order.status = new_status
-        order.updated_at = datetime.utcnow()
-        # Log the change
-        _create_log(order.id, from_status=old_status, to_status=new_status)
+        now = datetime.now(UTC)
+        cursor.execute(
+            """
+            UPDATE orders
+            SET status=%s, updated_at=%s
+            WHERE id=%s
+            """,
+            (new_status.value, now, orderId),
+        )
+        _create_log_db(conn, orderId, old_status, new_status, now)
+        conn.commit()
 
-    return order
+    # Fetch updated order
+    cursor.execute(
+        """
+        SELECT id, user_id, item_id, status, total_rent, deposit,
+               created_at, updated_at, start_date, end_date
+        FROM orders
+        WHERE id = %s
+        """,
+        (orderId,),
+    )
+    row2 = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return _row_to_order(row2)
 
 
 @app.get("/orders/{orderId}/logs", response_model=List[OrderLogRead], tags=["admins"])
-def get_order_logs(
-        orderId: int = Path(..., description="ID of the order")
+def get_order_logs(orderId: int = Path(...)):
+    """
+    Retrieve all status transition logs belonging to a specific order.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT log_id, order_id, from_status, to_status, timestamp
+        FROM order_logs
+        WHERE order_id = %s
+        ORDER BY timestamp ASC, log_id ASC
+        """,
+        (orderId,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return [_row_to_log(r) for r in rows]
+
+
+# ---------------------------------------------------------------------
+# ASYNC CONFIRMATION + JOBS API
+# ---------------------------------------------------------------------
+@app.post("/orders/{orderId}/confirm", tags=["users"])
+def confirm_order(
+    orderId: int = Path(...),
+    background_tasks: BackgroundTasks = None,
+    response: Response = None,
 ):
-    """Fetches the audit log for status transitions of a specific order."""
-    if orderId not in orders:
-        # Check if the order itself exists
-        raise HTTPException(status_code=404, detail="Order not found")
+    """
+    Start an asynchronous confirmation workflow.
+    Returns:
+      - 202 Accepted
+      - Location header → /jobs/{jobId}
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, status
+        FROM orders
+        WHERE id = %s
+        """,
+        (orderId,),
+    )
+    row = cursor.fetchone()
 
-    return order_logs.get(orderId, [])
+    if row is None:
+        cursor.close()
+        conn.close()
+        raise HTTPException(404, "Order not found")
+
+    current_status = OrderStatus(row[1])
+    if current_status != OrderStatus.PENDING:
+        cursor.close()
+        conn.close()
+        raise HTTPException(400, "Only pending orders can be confirmed")
+
+    # Create a job entry in DB
+    job_id = str(uuid.uuid4())
+    cursor.execute(
+        """
+        INSERT INTO jobs (job_id, order_id, status, result)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (job_id, orderId, JobStatus.PENDING.value, None),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    # Mirror job in memory for real-time tracking
+    jobs_memory[job_id] = {
+        "jobId": job_id,
+        "orderId": orderId,
+        "status": JobStatus.PENDING.value,
+        "result": None,
+    }
+
+    # Trigger async processing
+    background_tasks.add_task(_process_confirm_order, orderId, job_id)
+
+    response.status_code = 202
+    response.headers["Location"] = f"/jobs/{job_id}"
+    return {"jobId": job_id, "status": JobStatus.PENDING.value}
 
 
-# -----------------------------------------------------------------------------
-# Root
-# -----------------------------------------------------------------------------
+@app.get("/jobs/{jobId}", response_model=JobRead, tags=["jobs"])
+def get_job(jobId: str = Path(...), response: Response = None):
+    """
+    Query job status.
+    If job is not completed:
+      - Return HTTP 202 with Location header (polling pattern)
+    If completed:
+      - Return HTTP 200 with final status + result
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT job_id, order_id, status, result
+        FROM jobs
+        WHERE job_id = %s
+        """,
+        (jobId,),
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(404, "Job not found")
+
+    status = JobStatus(row[2])
+
+    # Pending or running → keep returning 202
+    if status in (JobStatus.PENDING, JobStatus.RUNNING):
+        response.status_code = 202
+        response.headers["Location"] = f"/jobs/{jobId}"
+
+    return JobRead(
+        job_id=row[0],
+        order_id=row[1],
+        status=status,
+        result=row[3],
+    )
+
+# ---------------------------------------------------------------------
+# Root Endpoint & __main__
+# ---------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "Welcome to the Order & Rental Service API. See /docs for OpenAPI UI."}
+    """
+    Health check endpoint.
+    """
+    return {"message": "Order & Rental Service API is running. See /docs for API explorer."}
 
 
-# -----------------------------------------------------------------------------
-# Entrypoint for `python main.py`
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
 

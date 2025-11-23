@@ -13,3 +13,12 @@ starlette==0.47.3
 typing-inspection==0.4.1
 typing_extensions==4.15.0
 uvicorn==0.35.0
+
+# Database
+SQLAlchemy==2.0.36
+PyMySQL==1.1.2
+mysql-connector-python
+
+# Cloud run
+google-cloud-secret-manager
+
