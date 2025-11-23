@@ -21,7 +21,7 @@ from models.job import JobRead, JobStatus
 # ---------------------------------------------------------------------
 # Server Port Configuration (Cloud Run / local development)
 # ---------------------------------------------------------------------
-port = int(os.environ.get("FASTAPIPORT", 8000))
+port = int(os.environ.get("PORT", os.environ.get("FASTAPIPORT", 8000)))
 
 # ---------------------------------------------------------------------
 # Secret Manager helper for retrieving MySQL password
