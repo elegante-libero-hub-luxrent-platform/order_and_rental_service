@@ -7,6 +7,8 @@ from typing import Dict, List, Optional
 
 import mysql.connector
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Path, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+
 from google.cloud import secretmanager
 
 from models.order import (
@@ -17,6 +19,7 @@ from models.order import (
 )
 from models.log import OrderLogRead
 from models.job import JobRead, JobStatus
+
 
 # ---------------------------------------------------------------------
 # Server Port Configuration (Cloud Run / local development)
@@ -81,6 +84,14 @@ app = FastAPI(
     title="Order & Rental Service API",
     description="Handles order lifecycle, state transitions, async jobs, and logging.",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"], 
 )
 
 # ---------------------------------------------------------------------
