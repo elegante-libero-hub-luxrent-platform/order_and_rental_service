@@ -53,7 +53,18 @@ jobs_memory: Dict[str, Dict] = {}
 def get_connection():
     """
     Create a new MySQL connection.
+    Supports both Unix socket (Cloud Run with Cloud SQL) and TCP (local development).
     """
+    # Check if using Unix socket (Cloud Run with Cloud SQL)
+    if DB_HOST and DB_HOST.startswith('/cloudsql/'):
+        # Use Unix socket connection for Cloud Run
+        return mysql.connector.connect(
+            unix_socket=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+        )
+    # Use TCP connection for local development
     return mysql.connector.connect(
         host=DB_HOST,
         user=DB_USER,
