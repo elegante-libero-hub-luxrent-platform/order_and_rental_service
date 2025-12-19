@@ -407,7 +407,7 @@ def get_order_by_id(orderId: int = Path(...)):
     return _row_to_order(row)
 
 
-@app.delete("/orders/{orderId}", tags=["users"])
+@app.patch("/orders/{orderId}/cancel", tags=["users"])
 def cancel_order(orderId: int = Path(...)):
     """
     Cancel an order.
@@ -452,6 +452,33 @@ def cancel_order(orderId: int = Path(...)):
     conn.close()
 
     return {"message": "Order cancelled successfully"}
+
+@app.delete("/orders/{orderId}", tags=["admins"])
+def delete_order(orderId: int = Path(...)):
+    """
+    Hard delete an order (physical deletion).
+    This removes the order row from `orders`, and also deletes related rows in `order_logs` and `jobs`
+    to avoid orphan records.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT status FROM orders WHERE id = %s", (orderId,))
+    row = cursor.fetchone()
+    if row is None:
+        cursor.close()
+        conn.close()
+        raise HTTPException(404, "Order not found")
+
+    cursor.execute("DELETE FROM order_logs WHERE order_id = %s", (orderId,))
+    cursor.execute("DELETE FROM jobs WHERE order_id = %s", (orderId,))
+    cursor.execute("DELETE FROM orders WHERE id = %s", (orderId,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {"message": "Order deleted successfully", "orderId": orderId}
 
 
 @app.patch("/orders/{orderId}/status", response_model=OrderRead, tags=["admins"])
